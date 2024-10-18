@@ -1,4 +1,5 @@
 import sys
+
 import nox
 
 
@@ -38,4 +39,3 @@ def tests(session):
 def lint(session):
     session.run("pip", "install", "black", "ruff")
     session.run("black", "robyn/", "integration_tests/")
-    session.run("ruff", "robyn/", "integration_tests/")

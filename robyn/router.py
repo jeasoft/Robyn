@@ -1,16 +1,22 @@
+import inspect
+import logging
 from abc import ABC, abstractmethod
 from asyncio import iscoroutinefunction
 from functools import wraps
 from inspect import signature
 from types import CoroutineType
-from typing import Callable, Dict, List, NamedTuple, Union, Optional
-from robyn.authentication import AuthenticationHandler, AuthenticationNotConfiguredError
+from typing import Callable, Dict, List, NamedTuple, Optional, Union
 
-from robyn.robyn import FunctionInfo, HttpMethod, MiddlewareType, Request, Response
 from robyn import status_codes
-
+from robyn.authentication import AuthenticationHandler, AuthenticationNotConfiguredError
+from robyn.dependency_injection import DependencyMap
+from robyn.jsonify import jsonify
+from robyn.responses import FileResponse
+from robyn.robyn import FunctionInfo, Headers, HttpMethod, Identity, MiddlewareType, QueryParams, Request, Response, Url
+from robyn.types import Body, Files, FormData, IPAddress, Method, PathParams
 from robyn.ws import WebSocket
-from robyn.types import Header
+
+_logger = logging.getLogger(__name__)
 
 
 class Route(NamedTuple):
@@ -33,8 +39,7 @@ class GlobalMiddleware(NamedTuple):
 
 class BaseRouter(ABC):
     @abstractmethod
-    def add_route(*args) -> Union[Callable, CoroutineType, WebSocket]:
-        ...
+    def add_route(*args) -> Union[Callable, CoroutineType, WebSocket]: ...
 
 
 class Router(BaseRouter):
@@ -44,31 +49,56 @@ class Router(BaseRouter):
 
     def _format_response(
         self,
-        res: dict,
-        default_response_header: dict,
+        res: Union[Dict, Response, bytes, tuple, str],
     ) -> Response:
-        headers = {"Content-Type": "text/plain"} if not default_response_header else default_response_header
+        headers = Headers({"Content-Type": "text/plain"})
+
         response = {}
         if isinstance(res, dict):
-            status_code = res.get("status_code", status_codes.HTTP_200_OK)
-            headers = res.get("headers", headers)
-            description = res.get("description", "")
+            # this should change
+            headers = Headers({})
+            if "Content-Type" not in headers:
+                headers.set("Content-Type", "application/json")
 
-            if not isinstance(status_code, int):
-                status_code = int(status_code)  # status_code can potentially be string
+            description = jsonify(res)
 
-            response = Response(status_code=status_code, headers=headers, description=description)
-            file_path = res.get("file_path")
-            if file_path is not None:
-                response.file_path = file_path
-        elif isinstance(res, Response):
-            response = res
-        elif isinstance(res, bytes):
             response = Response(
                 status_code=status_codes.HTTP_200_OK,
-                headers={"Content-Type": "application/octet-stream"},
+                headers=headers,
+                description=description,
+            )
+        elif isinstance(res, Response):
+            response = res
+        elif isinstance(res, FileResponse):
+            response = Response(
+                status_code=res.status_code,
+                headers=res.headers,
+                description=res.file_path,
+            )
+            response.file_path = res.file_path
+
+        elif isinstance(res, bytes):
+            headers = Headers({"Content-Type": "application/octet-stream"})
+            response = Response(
+                status_code=status_codes.HTTP_200_OK,
+                headers=headers,
                 description=res,
             )
+        elif isinstance(res, tuple):
+            if len(res) != 3:
+                raise ValueError("Tuple should have 3 elements")
+            else:
+                description, headers, status_code = res
+                description = self._format_response(description).description
+                new_headers = Headers(headers)
+                if "Content-Type" in new_headers:
+                    headers.set("Content-Type", new_headers.get("Content-Type"))
+
+                response = Response(
+                    status_code=status_code,
+                    headers=headers,
+                    description=description,
+                )
         else:
             response = Response(
                 status_code=status_codes.HTTP_200_OK,
@@ -84,49 +114,133 @@ class Router(BaseRouter):
         handler: Callable,
         is_const: bool,
         exception_handler: Optional[Callable],
-        default_response_headers: List[Header],
+        injected_dependencies: dict,
     ) -> Union[Callable, CoroutineType]:
-        response_headers = {d.key: d.val for d in default_response_headers}
+        def wrapped_handler(*args, **kwargs):
+            # In the execute functions the request is passed into *args
+            request = next(filter(lambda it: isinstance(it, Request), args), None)
+
+            handler_params = signature(handler).parameters
+
+            if not request or (len(handler_params) == 1 and next(iter(handler_params)) is Request):
+                return handler(*args, **kwargs)
+
+            type_mapping = {
+                "request": Request,
+                "query_params": QueryParams,
+                "headers": Headers,
+                "path_params": PathParams,
+                "body": Body,
+                "method": Method,
+                "url": Url,
+                "form_data": FormData,
+                "files": Files,
+                "ip_addr": IPAddress,
+                "identity": Identity,
+            }
+
+            type_filtered_params = {}
+
+            for handler_param in iter(handler_params):
+                for type_name in type_mapping:
+                    handler_param_type = handler_params[handler_param].annotation
+                    handler_param_name = handler_params[handler_param].name
+                    if handler_param_type is Request:
+                        type_filtered_params[handler_param_name] = request
+                    elif handler_param_type is type_mapping[type_name]:
+                        type_filtered_params[handler_param_name] = getattr(request, type_name)
+                    elif inspect.isclass(handler_param_type):
+                        if issubclass(handler_param_type, Body):
+                            type_filtered_params[handler_param_name] = getattr(request, "body")
+                        elif issubclass(handler_param_type, QueryParams):
+                            type_filtered_params[handler_param_name] = getattr(request, "query_params")
+
+            request_components = {
+                "r": request,
+                "req": request,
+                "request": request,
+                "query_params": request.query_params,
+                "headers": request.headers,
+                "path_params": request.path_params,
+                "body": request.body,
+                "method": request.method,
+                "url": request.url,
+                "ip_addr": request.ip_addr,
+                "identity": request.identity,
+                "form_data": request.form_data,
+                "files": request.files,
+                "router_dependencies": injected_dependencies["router_dependencies"],
+                "global_dependencies": injected_dependencies["global_dependencies"],
+                **kwargs,
+            }
+
+            name_filtered_params = {k: v for k, v in request_components.items() if k in handler_params and k not in type_filtered_params}
+
+            filtered_params = dict(**type_filtered_params, **name_filtered_params)
+
+            if len(filtered_params) != len(handler_params):
+                invalid_args = set(handler_params) - set(filtered_params)
+                raise SyntaxError(f"Unexpected request params found: {invalid_args}")
+
+            return handler(**filtered_params)
 
         @wraps(handler)
-        async def async_inner_handler(*args):
+        async def async_inner_handler(*args, **kwargs):
             try:
                 response = self._format_response(
-                    await handler(*args),
-                    response_headers,
+                    await wrapped_handler(*args, **kwargs),
                 )
             except Exception as err:
                 if exception_handler is None:
                     raise
                 response = self._format_response(
                     exception_handler(err),
-                    response_headers,
                 )
             return response
 
         @wraps(handler)
-        def inner_handler(*args):
+        def inner_handler(*args, **kwargs):
             try:
                 response = self._format_response(
-                    handler(*args),
-                    response_headers,
+                    wrapped_handler(*args, **kwargs),
                 )
             except Exception as err:
                 if exception_handler is None:
                     raise
                 response = self._format_response(
                     exception_handler(err),
-                    response_headers,
                 )
             return response
 
         number_of_params = len(signature(handler).parameters)
+        # these are the arguments
+        params = dict(inspect.signature(handler).parameters)
+
+        new_injected_dependencies = {}
+        for dependency in injected_dependencies:
+            if dependency in params:
+                new_injected_dependencies[dependency] = injected_dependencies[dependency]
+            else:
+                _logger.debug(f"Dependency {dependency} is not used in the handler {handler.__name__}")
+
         if iscoroutinefunction(handler):
-            function = FunctionInfo(async_inner_handler, True, number_of_params)
+            function = FunctionInfo(
+                async_inner_handler,
+                True,
+                number_of_params,
+                params,
+                new_injected_dependencies,
+            )
             self.routes.append(Route(route_type, endpoint, function, is_const))
             return async_inner_handler
         else:
-            function = FunctionInfo(inner_handler, False, number_of_params)
+            function = FunctionInfo(
+                inner_handler,
+                False,
+                number_of_params,
+                params,
+                new_injected_dependencies,
+            )
             self.routes.append(Route(route_type, endpoint, function, is_const))
             return inner_handler
 
@@ -135,18 +249,40 @@ class Router(BaseRouter):
 
 
 class MiddlewareRouter(BaseRouter):
-    def __init__(self) -> None:
+    def __init__(self, dependencies: DependencyMap = DependencyMap()) -> None:
         super().__init__()
         self.global_middlewares: List[GlobalMiddleware] = []
         self.route_middlewares: List[RouteMiddleware] = []
         self.authentication_handler: Optional[AuthenticationHandler] = None
+        self.dependencies = dependencies
 
     def set_authentication_handler(self, authentication_handler: AuthenticationHandler):
         self.authentication_handler = authentication_handler
 
-    def add_route(self, middleware_type: MiddlewareType, endpoint: str, handler: Callable) -> Callable:
-        number_of_params = len(signature(handler).parameters)
-        function = FunctionInfo(handler, iscoroutinefunction(handler), number_of_params)
+    def add_route(
+        self,
+        middleware_type: MiddlewareType,
+        endpoint: str,
+        handler: Callable,
+        injected_dependencies: dict,
+    ) -> Callable:
+        params = dict(inspect.signature(handler).parameters)
+        number_of_params = len(params)
+
+        new_injected_dependencies = {}
+        for dependency in injected_dependencies:
+            if dependency in params:
+                new_injected_dependencies[dependency] = injected_dependencies[dependency]
+            else:
+                _logger.debug(f"Dependency {dependency} is not used in the middleware handler {handler.__name__}")
+
+        function = FunctionInfo(
+            handler,
+            iscoroutinefunction(handler),
+            number_of_params,
+            params,
+            new_injected_dependencies,
+        )
         self.route_middlewares.append(RouteMiddleware(middleware_type, endpoint, function))
         return handler
 
@@ -155,7 +291,10 @@ class MiddlewareRouter(BaseRouter):
         This method adds an authentication middleware to the specified endpoint.
         """
 
-        def inner(handler):
+        injected_dependencies = {}
+
+        def decorator(handler):
+            @wraps(handler)
             def inner_handler(request: Request, *args):
                 if not self.authentication_handler:
                     raise AuthenticationNotConfiguredError()
@@ -163,32 +302,48 @@ class MiddlewareRouter(BaseRouter):
                 if identity is None:
                     return self.authentication_handler.unauthorized_response
                 request.identity = identity
+
                 return request
 
-            self.add_route(MiddlewareType.BEFORE_REQUEST, endpoint, inner_handler)
+            self.add_route(
+                MiddlewareType.BEFORE_REQUEST,
+                endpoint,
+                inner_handler,
+                injected_dependencies,
+            )
             return inner_handler
 
-        return inner
+        return decorator
 
     # These inner functions are basically a wrapper around the closure(decorator) being returned.
     # They take a handler, convert it into a closure and return the arguments.
     # Arguments are returned as they could be modified by the middlewares.
     def add_middleware(self, middleware_type: MiddlewareType, endpoint: Optional[str]) -> Callable[..., None]:
+        # no dependency injection here
+        injected_dependencies = {}
+
         def inner(handler):
             @wraps(handler)
-            async def async_inner_handler(*args):
-                return await handler(*args)
+            async def async_inner_handler(*args, **kwargs):
+                return await handler(*args, **kwargs)
 
             @wraps(handler)
-            def inner_handler(*args):
-                return handler(*args)
+            def inner_handler(*args, **kwargs):
+                return handler(*args, **kwargs)
 
             if endpoint is not None:
                 if iscoroutinefunction(handler):
-                    self.add_route(middleware_type, endpoint, async_inner_handler)
+                    self.add_route(
+                        middleware_type,
+                        endpoint,
+                        async_inner_handler,
+                        injected_dependencies,
+                    )
                 else:
-                    self.add_route(middleware_type, endpoint, inner_handler)
+                    self.add_route(middleware_type, endpoint, inner_handler, injected_dependencies)
             else:
+                params = dict(inspect.signature(handler).parameters)
+
                 if iscoroutinefunction(handler):
                     self.global_middlewares.append(
                         GlobalMiddleware(
@@ -196,7 +351,9 @@ class MiddlewareRouter(BaseRouter):
                             FunctionInfo(
                                 async_inner_handler,
                                 True,
-                                len(signature(async_inner_handler).parameters),
+                                len(params),
+                                params,
+                                injected_dependencies,
                             ),
                         )
                     )
@@ -207,7 +364,9 @@ class MiddlewareRouter(BaseRouter):
                             FunctionInfo(
                                 inner_handler,
                                 False,
-                                len(signature(inner_handler).parameters),
+                                len(params),
+                                params,
+                                injected_dependencies,
                             ),
                         )
                     )

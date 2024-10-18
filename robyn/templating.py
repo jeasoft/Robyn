@@ -1,19 +1,17 @@
 from abc import ABC, abstractmethod
 
+from jinja2 import Environment, FileSystemLoader
+
 from robyn import status_codes
 
-from .robyn import Response
-
-from jinja2 import Environment, FileSystemLoader
+from .robyn import Headers, Response
 
 
 class TemplateInterface(ABC):
-    def __init__(self):
-        ...
+    def __init__(self): ...
 
     @abstractmethod
-    def render_template(self, *args, **kwargs) -> Response:
-        ...
+    def render_template(self, *args, **kwargs) -> Response: ...
 
 
 class JinjaTemplate(TemplateInterface):
@@ -25,7 +23,7 @@ class JinjaTemplate(TemplateInterface):
         return Response(
             status_code=status_codes.HTTP_200_OK,
             description=rendered_template,
-            headers={"Content-Type": "text/html; charset=utf-8"},
+            headers=Headers({"Content-Type": "text/html; charset=utf-8"}),
         )
 
 

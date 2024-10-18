@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, NewType, Optional, TypedDict
 
 
 @dataclass
@@ -18,10 +18,27 @@ class Directory:
         ]
 
 
-@dataclass
-class Header:
-    key: str
-    val: str
+PathParams = NewType("PathParams", Dict[str, str])
+Method = NewType("Method", str)
+FormData = NewType("FormData", Dict[str, str])
+Files = NewType("Files", Dict[str, bytes])
+IPAddress = NewType("IPAddress", Optional[str])
 
-    def as_list(self):
-        return [self.key, self.val]
+
+class JSONResponse(TypedDict):
+    """
+    A type alias for openapi response bodies. This class should be inherited by the response class type definition.
+    """
+
+    pass
+
+
+class Body:
+    """
+    A type alias for openapi request bodies. This class should be inherited by the request body class annotation.
+    """
+
+    pass
+
+
+__all__ = ["JSONResponse", "Body"]
